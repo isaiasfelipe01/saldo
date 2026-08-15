@@ -42,6 +42,8 @@ class TransactionBase(BaseModel):
 
 class TransactionCreate(TransactionBase):
     installments: Optional[int] = Field(1, ge=1, description="Number of installments for credit card purchases")
+    is_fixed: Optional[bool] = Field(False, description="Whether this is a fixed recurring expense")
+    fixed_months: Optional[int] = Field(None, ge=1, description="Number of months for fixed expense period")
 
 class TransactionUpdate(TransactionBase):
     pass

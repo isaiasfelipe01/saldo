@@ -384,6 +384,7 @@ def list_transactions(
     month: str = Query(..., description="Format 'YYYY-MM'"),
     search: Optional[str] = Query(None, description="Search in description"),
     category_id: Optional[UUID] = Query(None),
+    card_id: Optional[UUID] = Query(None),
     user_id: str = Depends(get_user_id)
 ):
     try:
@@ -400,6 +401,9 @@ def list_transactions(
         
         if category_id:
             query = query.eq("category_id", str(category_id))
+            
+        if card_id:
+            query = query.eq("card_id", str(card_id))
             
         response = query.order("date", desc=True).execute()
         
@@ -444,6 +448,8 @@ def create_transaction(transaction: TransactionCreate, user_id: str = Depends(ge
         utc_date = transaction.date.astimezone(timezone.utc)
         
         installments = transaction.installments or 1
+        is_fixed = transaction.is_fixed or False
+        fixed_months = transaction.fixed_months or 1
         
         # Validation for credit card and cash installments
         if transaction.payment_method == "dinheiro" and installments > 1:
@@ -476,7 +482,37 @@ def create_transaction(transaction: TransactionCreate, user_id: str = Depends(ge
 
         payloads = []
         
-        if installments > 1:
+        if is_fixed and fixed_months > 1:
+            for i in range(fixed_months):
+                inst_date = add_months(utc_date, i)
+                if transaction.fixed_months:
+                    desc_suffix = f" (Fixo {i+1}/{fixed_months})"
+                else:
+                    desc_suffix = " (Recorrente)"
+                inst_desc = (transaction.description or "") + desc_suffix if transaction.description else f"Despesa Fixa{desc_suffix}"
+                
+                # Future transactions are marked as provisions, current is not (unless requested)
+                inst_is_provision = transaction.is_provision
+                if i > 0:
+                    inst_is_provision = True
+                
+                inst_invoice_period = None
+                if transaction.payment_method == "cartao" and card_data:
+                    inst_invoice_period = calculate_invoice_period(inst_date, card_data["closing_day"])
+                    
+                payloads.append({
+                    "amount": transaction.amount,
+                    "type": transaction.type,
+                    "category_id": str(transaction.category_id),
+                    "description": inst_desc,
+                    "date": inst_date.isoformat(),
+                    "user_id": user_id,
+                    "is_provision": inst_is_provision,
+                    "payment_method": transaction.payment_method,
+                    "card_id": card_id,
+                    "invoice_period": inst_invoice_period
+                })
+        elif installments > 1:
             base_amount = transaction.amount // installments
             remainder = transaction.amount % installments
             
