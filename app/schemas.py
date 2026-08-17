@@ -119,3 +119,25 @@ class CreditCardSummaryResponse(BaseModel):
     due_day: int
     current_invoice_amount: int
     available_limit: int
+
+    class Config:
+        from_attributes = True
+
+# --- Budget Schemas ---
+
+class BudgetBase(BaseModel):
+    category_id: UUID
+    amount: int = Field(..., gt=0, description="Amount in cents, must be positive")
+    period: str = Field(..., description="Format: YYYY-MM")
+
+class BudgetCreate(BudgetBase):
+    pass
+
+class BudgetResponse(BudgetBase):
+    id: UUID
+    user_id: UUID
+    category_name: Optional[str] = None
+    category_icon: Optional[str] = None
+
+    class Config:
+        from_attributes = True

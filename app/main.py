@@ -21,6 +21,8 @@ from app.schemas import (
     CreditCardResponse,
     CreditCardUpdate,
     CreditCardSummaryResponse,
+    BudgetCreate,
+    BudgetResponse,
 )
 
 app = FastAPI(
@@ -969,5 +971,86 @@ def delete_credit_card(id: UUID, user_id: str = Depends(get_user_id)):
         return {"message": "Credit card deleted successfully."}
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- BUDGET ENDPOINTS (METAS DE GASTOS) ---
+
+@app.get("/budgets", response_model=List[BudgetResponse])
+def list_budgets(
+    period: str = Query(..., description="Format: YYYY-MM"),
+    user_id: str = Depends(get_user_id)
+):
+    try:
+        res = supabase_client.table("budgets").select("*, categories(name, icon)").eq("user_id", user_id).eq("period", period).execute()
+        budgets = []
+        for row in res.data or []:
+            cat = row.get("categories") or {}
+            budgets.append({
+                "id": row["id"],
+                "category_id": row["category_id"],
+                "amount": row["amount"],
+                "period": row["period"],
+                "user_id": row["user_id"],
+                "category_name": cat.get("name"),
+                "category_icon": cat.get("icon")
+            })
+        return budgets
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/budgets", response_model=BudgetResponse, status_code=status.HTTP_201_CREATED)
+def create_or_update_budget(
+    budget: BudgetCreate,
+    user_id: str = Depends(get_user_id)
+):
+    try:
+        res_check = supabase_client.table("budgets")\
+            .select("id")\
+            .eq("user_id", user_id)\
+            .eq("category_id", budget.category_id)\
+            .eq("period", budget.period)\
+            .execute()
+            
+        payload = {
+            "category_id": str(budget.category_id),
+            "amount": budget.amount,
+            "period": budget.period,
+            "user_id": user_id
+        }
+        
+        if res_check.data:
+            budget_id = res_check.data[0]["id"]
+            res = supabase_client.table("budgets").update(payload).eq("id", budget_id).execute()
+        else:
+            res = supabase_client.table("budgets").insert(payload).execute()
+            
+        row = res.data[0]
+        cat_res = supabase_client.table("categories").select("name, icon").eq("id", budget.category_id).execute()
+        cat = cat_res.data[0] if cat_res.data else {}
+        
+        return {
+            "id": row["id"],
+            "category_id": row["category_id"],
+            "amount": row["amount"],
+            "period": row["period"],
+            "user_id": row["user_id"],
+            "category_name": cat.get("name"),
+            "category_icon": cat.get("icon")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/budgets/{id}")
+def delete_budget(
+    id: UUID,
+    user_id: str = Depends(get_user_id)
+):
+    try:
+        supabase_client.table("budgets").delete().eq("id", str(id)).eq("user_id", user_id).execute()
+        return {"message": "Budget deleted successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
