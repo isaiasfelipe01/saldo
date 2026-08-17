@@ -806,6 +806,34 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
     except Exception as e:
         print(f"Error calculating card liabilities for next month: {str(e)}")
         
+    # 4. Calculate budget progress for the selected month
+    budgets_progress = []
+    try:
+        budgets_res = supabase_client.table("budgets").select("*").eq("user_id", user_id).eq("period", month_str).execute()
+        budgets_list = budgets_res.data or []
+        
+        if budgets_list:
+            cats_res = supabase_client.table("categories").select("id, name").eq("user_id", user_id).eq("type", 0).execute()
+            cats_map = {c["id"]: c["name"] for c in cats_res.data or []}
+            spent_by_name = {item["category_name"]: item["total"] for item in breakdown}
+            
+            for b in budgets_list:
+                spent_amount = 0
+                for cat_id in b.get("category_ids", []):
+                    cat_name = cats_map.get(cat_id)
+                    if cat_name:
+                        spent_amount += spent_by_name.get(cat_name, 0)
+                        
+                percentage = round((spent_amount / b["amount"]) * 100.0, 2) if b["amount"] > 0 else 0.0
+                budgets_progress.append({
+                    "name": b["name"],
+                    "amount": b["amount"],
+                    "spent_amount": spent_amount,
+                    "percentage": percentage
+                })
+    except Exception as e:
+        print(f"Error calculating budgets progress: {str(e)}")
+        
     return {
         "total_income": total_income,
         "total_expense": total_expense,
@@ -816,7 +844,8 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
         "next_month_provisions_expense": next_month_provisions_expense,
         "next_month_realized_expense": next_month_realized_expense,
         "next_month_card_liability": next_month_card_liability,
-        "category_breakdown": breakdown
+        "category_breakdown": breakdown,
+        "budgets": budgets_progress
     }
 
 
@@ -983,20 +1012,8 @@ def list_budgets(
     user_id: str = Depends(get_user_id)
 ):
     try:
-        res = supabase_client.table("budgets").select("*, categories(name, icon)").eq("user_id", user_id).eq("period", period).execute()
-        budgets = []
-        for row in res.data or []:
-            cat = row.get("categories") or {}
-            budgets.append({
-                "id": row["id"],
-                "category_id": row["category_id"],
-                "amount": row["amount"],
-                "period": row["period"],
-                "user_id": row["user_id"],
-                "category_name": cat.get("name"),
-                "category_icon": cat.get("icon")
-            })
-        return budgets
+        res = supabase_client.table("budgets").select("*").eq("user_id", user_id).eq("period", period).execute()
+        return res.data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1010,14 +1027,15 @@ def create_or_update_budget(
         res_check = supabase_client.table("budgets")\
             .select("id")\
             .eq("user_id", user_id)\
-            .eq("category_id", budget.category_id)\
+            .eq("name", budget.name)\
             .eq("period", budget.period)\
             .execute()
             
         payload = {
-            "category_id": str(budget.category_id),
+            "name": budget.name,
             "amount": budget.amount,
             "period": budget.period,
+            "category_ids": [str(c_id) for c_id in budget.category_ids],
             "user_id": user_id
         }
         
@@ -1027,19 +1045,7 @@ def create_or_update_budget(
         else:
             res = supabase_client.table("budgets").insert(payload).execute()
             
-        row = res.data[0]
-        cat_res = supabase_client.table("categories").select("name, icon").eq("id", budget.category_id).execute()
-        cat = cat_res.data[0] if cat_res.data else {}
-        
-        return {
-            "id": row["id"],
-            "category_id": row["category_id"],
-            "amount": row["amount"],
-            "period": row["period"],
-            "user_id": row["user_id"],
-            "category_name": cat.get("name"),
-            "category_icon": cat.get("icon")
-        }
+        return res.data[0]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

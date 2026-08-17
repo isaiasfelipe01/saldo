@@ -67,16 +67,17 @@ INSERT INTO categories (name, icon, type, is_default, user_id) VALUES
 ('Outros', '📦', 1, true, '00000000-0000-0000-0000-000000000001')
 ON CONFLICT (user_id, name) DO NOTHING;
 
--- 7. Create Budgets Table (Metas de Gastos)
+-- 7. Create Budgets Table (Metas de Gastos por Grupo)
 CREATE TABLE IF NOT EXISTS budgets (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    category_id UUID NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    name VARCHAR(100) NOT NULL,
     amount BIGINT NOT NULL, -- limit in cents (e.g. 50000 = R$ 500.00)
     period VARCHAR(7) NOT NULL, -- format: YYYY-MM
+    category_ids UUID[] NOT NULL, -- list of category IDs covered by this budget group
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    -- Ensures a user can only have one budget per category per month
-    CONSTRAINT unique_category_period_user UNIQUE(category_id, period, user_id)
+    -- Ensures a user can only have one budget with the same name in a given month
+    CONSTRAINT unique_name_period_user UNIQUE(name, period, user_id)
 );
 
 -- Index for performance

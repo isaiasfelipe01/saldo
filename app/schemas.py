@@ -76,6 +76,12 @@ class CategoryBreakdownItem(BaseModel):
     total: int
     percentage: float
 
+class BudgetProgressItem(BaseModel):
+    name: str
+    amount: int
+    spent_amount: int
+    percentage: float
+
 class SummaryResponse(BaseModel):
     total_income: int
     total_expense: int
@@ -87,6 +93,7 @@ class SummaryResponse(BaseModel):
     next_month_realized_expense: int = 0
     next_month_card_liability: int = 0
     category_breakdown: List[CategoryBreakdownItem]
+    budgets: List[BudgetProgressItem] = []
 
 
 # --- Credit Card Schemas ---
@@ -126,9 +133,10 @@ class CreditCardSummaryResponse(BaseModel):
 # --- Budget Schemas ---
 
 class BudgetBase(BaseModel):
-    category_id: UUID
+    name: str = Field(..., min_length=1, max_length=100, description="Name of the budget group")
     amount: int = Field(..., gt=0, description="Amount in cents, must be positive")
     period: str = Field(..., description="Format: YYYY-MM")
+    category_ids: List[UUID] = Field(..., description="List of category IDs covered by this budget")
 
 class BudgetCreate(BudgetBase):
     pass
@@ -136,8 +144,6 @@ class BudgetCreate(BudgetBase):
 class BudgetResponse(BudgetBase):
     id: UUID
     user_id: UUID
-    category_name: Optional[str] = None
-    category_icon: Optional[str] = None
 
     class Config:
         from_attributes = True
