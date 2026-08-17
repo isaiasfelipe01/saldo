@@ -741,17 +741,69 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
     next_start_iso, next_end_iso = get_month_boundaries(next_month_str)
     
     response_next = supabase_client.table("transactions")\
-        .select("amount, type, is_provision")\
+        .select("amount, type, is_provision, payment_method, card_id")\
         .eq("user_id", user_id)\
         .eq("type", 0)\
         .gte("date", next_start_iso)\
         .lte("date", next_end_iso)\
         .execute()
         
-    next_txs = response_next.data
-    next_month_provisions_expense = sum(t.get("amount", 0) for t in next_txs if t.get("is_provision", False))
-    next_month_realized_expense = sum(t.get("amount", 0) for t in next_txs if not t.get("is_provision", False))
+    next_txs = response_next.data or []
+    # Exclude card provisions (card_id is not null)
+    next_month_provisions_expense = sum(
+        t.get("amount", 0) for t in next_txs 
+        if t.get("is_provision", False) and t.get("card_id") is None
+    )
+    # Exclude card purchases (payment_method == "cartao")
+    next_month_realized_expense = sum(
+        t.get("amount", 0) for t in next_txs 
+        if not t.get("is_provision", False) and t.get("payment_method") != "cartao"
+    )
     
+    # Calculate next month's credit card invoices due
+    next_month_card_liability = 0
+    try:
+        cards_response = supabase_client.table("credit_cards").select("id, name, closing_day, due_day").eq("user_id", user_id).execute()
+        cards = cards_response.data or []
+        for card in cards:
+            card_id = card["id"]
+            closing_day = card["closing_day"]
+            due_day = card["due_day"]
+            
+            # Determine invoice period due in next month
+            if due_day > closing_day:
+                due_period = next_month_str
+            else:
+                due_period = month_str
+                
+            # Check for existing invoice provision
+            tx_prov_check = supabase_client.table("transactions")\
+                .select("amount")\
+                .eq("user_id", user_id)\
+                .eq("card_id", card_id)\
+                .eq("is_provision", True)\
+                .eq("invoice_period", due_period)\
+                .execute()
+                
+            if tx_prov_check.data:
+                invoice_amount = sum(t["amount"] for t in tx_prov_check.data)
+            else:
+                # Sum card purchases for this period
+                tx_purchases = supabase_client.table("transactions")\
+                    .select("amount")\
+                    .eq("user_id", user_id)\
+                    .eq("card_id", card_id)\
+                    .eq("type", 0)\
+                    .eq("payment_method", "cartao")\
+                    .eq("is_provision", False)\
+                    .eq("invoice_period", due_period)\
+                    .execute()
+                invoice_amount = sum(t["amount"] for t in tx_purchases.data)
+                
+            next_month_card_liability += invoice_amount
+    except Exception as e:
+        print(f"Error calculating card liabilities for next month: {str(e)}")
+        
     return {
         "total_income": total_income,
         "total_expense": total_expense,
@@ -761,6 +813,7 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
         "total_provisions_expense": total_provisions_expense,
         "next_month_provisions_expense": next_month_provisions_expense,
         "next_month_realized_expense": next_month_realized_expense,
+        "next_month_card_liability": next_month_card_liability,
         "category_breakdown": breakdown
     }
 

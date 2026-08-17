@@ -85,6 +85,7 @@ class SummaryResponse(BaseModel):
     total_provisions_income: int = 0
     next_month_provisions_expense: int = 0
     next_month_realized_expense: int = 0
+    next_month_card_liability: int = 0
     category_breakdown: List[CategoryBreakdownItem]
 
 
