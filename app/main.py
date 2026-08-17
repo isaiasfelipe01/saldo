@@ -729,6 +729,29 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
     # Sort breakdown in descending order of total expenses
     breakdown.sort(key=lambda x: x["total"], reverse=True)
     
+    # 3. Calculate provisions and realized expenses for next month
+    try:
+        ref_date = datetime.strptime(month_str, "%Y-%m")
+        next_month_date = add_months(ref_date, 1)
+        next_month_str = next_month_date.strftime("%Y-%m")
+    except Exception:
+        next_month_date = datetime.now() + timedelta(days=30)
+        next_month_str = next_month_date.strftime("%Y-%m")
+        
+    next_start_iso, next_end_iso = get_month_boundaries(next_month_str)
+    
+    response_next = supabase_client.table("transactions")\
+        .select("amount, type, is_provision")\
+        .eq("user_id", user_id)\
+        .eq("type", 0)\
+        .gte("date", next_start_iso)\
+        .lte("date", next_end_iso)\
+        .execute()
+        
+    next_txs = response_next.data
+    next_month_provisions_expense = sum(t.get("amount", 0) for t in next_txs if t.get("is_provision", False))
+    next_month_realized_expense = sum(t.get("amount", 0) for t in next_txs if not t.get("is_provision", False))
+    
     return {
         "total_income": total_income,
         "total_expense": total_expense,
@@ -736,6 +759,8 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
         "total_card_expense": total_card_expense,
         "total_provisions_income": total_provisions_income,
         "total_provisions_expense": total_provisions_expense,
+        "next_month_provisions_expense": next_month_provisions_expense,
+        "next_month_realized_expense": next_month_realized_expense,
         "category_breakdown": breakdown
     }
 
