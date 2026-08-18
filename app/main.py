@@ -703,20 +703,21 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
             if tx_type == 1:
                 total_income += amount
             else:
-                total_expense += amount
                 if payment_method == "cartao":
                     total_card_expense += amount
-                
-                cat = tx.get("categories")
-                if cat:
-                    cat_id = cat.get("id")
-                    if cat_id not in category_totals:
-                        category_totals[cat_id] = {
-                            "category_name": cat.get("name"),
-                            "icon": cat.get("icon"),
-                            "total": 0
-                        }
-                    category_totals[cat_id]["total"] += amount
+                else:
+                    total_expense += amount
+                    
+                    cat = tx.get("categories")
+                    if cat:
+                        cat_id = cat.get("id")
+                        if cat_id not in category_totals:
+                            category_totals[cat_id] = {
+                                "category_name": cat.get("name"),
+                                "icon": cat.get("icon"),
+                                "total": 0
+                            }
+                        category_totals[cat_id]["total"] += amount
                     
     breakdown = []
     for cat_id, data in category_totals.items():
