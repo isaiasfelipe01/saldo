@@ -949,24 +949,14 @@ def get_monthly_trend(
                 amount = tx.get("amount", 0)
                 tx_type = tx.get("type", 0)
                 payment_method = tx.get("payment_method", "dinheiro")
-                card_id = tx.get("card_id")
-                
-                cat = tx.get("categories")
-                cat_name = cat.get("name") if cat else ""
-                
-                is_invoice_payment = (
-                    (payment_method == "dinheiro" and card_id is not None) or
-                    (cat_name.lower() in ("crédito", "credito"))
-                )
                 
                 if tx_type == 1:
                     monthly_data[tx_month]["income"] += amount
                 else:
-                    if not is_invoice_payment:
-                        if payment_method == "cartao":
-                            monthly_data[tx_month]["card_expense"] += amount
-                        else:
-                            monthly_data[tx_month]["expense"] += amount
+                    if payment_method == "cartao":
+                        monthly_data[tx_month]["card_expense"] += amount
+                    else:
+                        monthly_data[tx_month]["expense"] += amount
                             
         trend_items = []
         for m in months:
