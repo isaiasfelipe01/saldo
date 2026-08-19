@@ -23,6 +23,7 @@ from app.schemas import (
     CreditCardSummaryResponse,
     BudgetCreate,
     BudgetResponse,
+    MonthlyTrendResponse,
 )
 
 app = FastAPI(
@@ -897,6 +898,87 @@ def get_top_categories(
         summary = calculate_summary(user_id, month_val)
         # Return only the top 3 highest expense categories
         return summary["category_breakdown"][:3]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.get("/summary/trend", response_model=MonthlyTrendResponse)
+def get_monthly_trend(
+    month: Optional[str] = Query(None, description="Format 'YYYY-MM', defaults to current month"),
+    user_id: str = Depends(get_user_id)
+):
+    try:
+        ref_month_str = month if month else datetime.now(timezone.utc).strftime("%Y-%m")
+        ref_date = datetime.strptime(ref_month_str, "%Y-%m")
+        
+        months = []
+        for i in range(-3, 4):
+            m_date = add_months(ref_date, i)
+            months.append(m_date.strftime("%Y-%m"))
+            
+        start_month_str = months[0]
+        end_month_str = months[-1]
+        
+        start_iso, _ = get_month_boundaries(start_month_str)
+        _, end_iso = get_month_boundaries(end_month_str)
+        
+        tx_res = supabase_client.table("transactions")\
+            .select("amount, type, date, payment_method, is_provision, card_id, categories(name)")\
+            .eq("user_id", user_id)\
+            .gte("date", start_iso)\
+            .lte("date", end_iso)\
+            .execute()
+            
+        txs = tx_res.data or []
+        
+        monthly_data = {m: {"income": 0, "expense": 0, "card_expense": 0} for m in months}
+        
+        for tx in txs:
+            date_str = tx.get("date")
+            if not date_str:
+                continue
+            
+            try:
+                tx_month = date_str[:7]
+            except Exception:
+                continue
+                
+            if tx_month in monthly_data:
+                amount = tx.get("amount", 0)
+                tx_type = tx.get("type", 0)
+                payment_method = tx.get("payment_method", "dinheiro")
+                card_id = tx.get("card_id")
+                
+                cat = tx.get("categories")
+                cat_name = cat.get("name") if cat else ""
+                
+                is_invoice_payment = (
+                    (payment_method == "dinheiro" and card_id is not None) or
+                    (cat_name.lower() in ("crédito", "credito"))
+                )
+                
+                if tx_type == 1:
+                    monthly_data[tx_month]["income"] += amount
+                else:
+                    if not is_invoice_payment:
+                        if payment_method == "cartao":
+                            monthly_data[tx_month]["card_expense"] += amount
+                        else:
+                            monthly_data[tx_month]["expense"] += amount
+                            
+        trend_items = []
+        for m in months:
+            trend_items.append({
+                "month": m,
+                "income": monthly_data[m]["income"],
+                "expense": monthly_data[m]["expense"],
+                "card_expense": monthly_data[m]["card_expense"]
+            })
+            
+        return {"trend": trend_items}
+        
     except HTTPException:
         raise
     except Exception as e:

@@ -147,3 +147,15 @@ class BudgetResponse(BudgetBase):
 
     class Config:
         from_attributes = True
+
+
+# --- Monthly Trend Schemas ---
+
+class MonthlyTrendItem(BaseModel):
+    month: str
+    income: int
+    expense: int
+    card_expense: int
+
+class MonthlyTrendResponse(BaseModel):
+    trend: List[MonthlyTrendItem]
