@@ -703,11 +703,20 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
             if tx_type == 1:
                 total_income += amount
             else:
+                card_id = tx.get("card_id")
+                
+                # 1. Cash flow totals
                 if payment_method == "cartao":
                     total_card_expense += amount
                 else:
                     total_expense += amount
-                    
+                
+                # 2. Consumption totals for categories and budgets
+                # Include cash purchases (card_id is None) and card purchases (payment_method == "cartao").
+                # Exclude invoice payments (payment_method == "dinheiro" and card_id is not null).
+                is_invoice_payment = (payment_method == "dinheiro" and card_id is not None)
+                
+                if not is_invoice_payment:
                     cat = tx.get("categories")
                     if cat:
                         cat_id = cat.get("id")
@@ -719,9 +728,12 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
                             }
                         category_totals[cat_id]["total"] += amount
                     
+    # Calculate total consumption (sum of all categorized expenses including cash & card)
+    total_consumption = sum(data["total"] for data in category_totals.values())
+    
     breakdown = []
     for cat_id, data in category_totals.items():
-        percentage = (data["total"] / total_expense * 100.0) if total_expense > 0 else 0.0
+        percentage = (data["total"] / total_consumption * 100.0) if total_consumption > 0 else 0.0
         breakdown.append({
             "category_name": data["category_name"],
             "icon": data["icon"],
