@@ -713,11 +713,16 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
                 
                 # 2. Consumption totals for categories and budgets
                 # Include cash purchases (card_id is None) and card purchases (payment_method == "cartao").
-                # Exclude invoice payments (payment_method == "dinheiro" and card_id is not null).
-                is_invoice_payment = (payment_method == "dinheiro" and card_id is not None)
+                # Exclude invoice payments (payment_method == "dinheiro" and card_id is not null) or manual 'Crédito' payments.
+                cat = tx.get("categories")
+                cat_name = cat.get("name") if cat else ""
+                
+                is_invoice_payment = (
+                    (payment_method == "dinheiro" and card_id is not None) or
+                    (cat_name.lower() in ("crédito", "credito"))
+                )
                 
                 if not is_invoice_payment:
-                    cat = tx.get("categories")
                     if cat:
                         cat_id = cat.get("id")
                         if cat_id not in category_totals:
