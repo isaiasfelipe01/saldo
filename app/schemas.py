@@ -62,6 +62,7 @@ class TransactionResponse(BaseModel):
     payment_method: str = "dinheiro"
     card_id: Optional[UUID] = None
     invoice_period: Optional[str] = None
+    source: str = "manual"
     category: Optional[CategoryResponse] = None
 
     class Config:
@@ -126,6 +127,7 @@ class CreditCardSummaryResponse(BaseModel):
     due_day: int
     current_invoice_amount: int
     available_limit: int
+    source: str = "manual"
 
     class Config:
         from_attributes = True
@@ -159,3 +161,35 @@ class MonthlyTrendItem(BaseModel):
 
 class MonthlyTrendResponse(BaseModel):
     trend: List[MonthlyTrendItem]
+
+
+# --- Pluggy / Open Finance Schemas ---
+
+class PluggyConnectTokenRequest(BaseModel):
+    item_id: Optional[str] = None
+
+
+class PluggyConnectTokenResponse(BaseModel):
+    access_token: str
+    include_sandbox: bool = False
+
+
+class PluggyItemRegisterRequest(BaseModel):
+    item_id: str = Field(..., min_length=1)
+
+
+class PluggyConnectionResponse(BaseModel):
+    item_id: str
+    connector_name: str
+    connector_image_url: Optional[str] = None
+    status: str
+    execution_status: Optional[str] = None
+    last_successful_update_at: Optional[datetime] = None
+    next_auto_sync_at: Optional[datetime] = None
+    last_sync_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+
+
+class PluggySyncResponse(BaseModel):
+    message: str
+    connections_queued: int

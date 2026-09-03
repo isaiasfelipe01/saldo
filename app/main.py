@@ -1,10 +1,12 @@
 import calendar
+import secrets
 import uuid
 from uuid import UUID
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional
+from typing import Any, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import supabase_client
@@ -24,6 +26,21 @@ from app.schemas import (
     BudgetCreate,
     BudgetResponse,
     MonthlyTrendResponse,
+    PluggyConnectionResponse,
+    PluggyConnectTokenRequest,
+    PluggyConnectTokenResponse,
+    PluggyItemRegisterRequest,
+    PluggySyncResponse,
+)
+from app.config import settings
+from app.pluggy import (
+    PluggyClient,
+    PluggyError,
+    delete_imported_item_data,
+    reconcile_item,
+    sync_accounts,
+    sync_transactions,
+    upsert_connection,
 )
 
 app = FastAPI(
@@ -40,6 +57,45 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_pluggy_client: Optional[PluggyClient] = None
+
+
+def get_pluggy_client() -> PluggyClient:
+    global _pluggy_client
+    if not settings.pluggy_client_id or not settings.pluggy_client_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A integração Pluggy ainda não foi configurada no servidor.",
+        )
+    if _pluggy_client is None:
+        _pluggy_client = PluggyClient(settings.pluggy_client_id, settings.pluggy_client_secret)
+    return _pluggy_client
+
+
+def pluggy_webhook_url() -> str:
+    if not settings.pluggy_webhook_url or not settings.pluggy_webhook_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Configure PLUGGY_WEBHOOK_URL e PLUGGY_WEBHOOK_SECRET no servidor.",
+        )
+    parts = urlsplit(settings.pluggy_webhook_url)
+    if parts.scheme != "https" or not parts.netloc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="PLUGGY_WEBHOOK_URL precisa ser uma URL HTTPS pública.",
+        )
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["token"] = settings.pluggy_webhook_secret
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def raise_pluggy_http_error(error: PluggyError) -> None:
+    if error.status_code in (400, 404, 409, 422):
+        http_status = error.status_code
+    else:
+        http_status = status.HTTP_502_BAD_GATEWAY
+    raise HTTPException(status_code=http_status, detail=str(error))
 
 
 # Helper: Validate and return User ID header, and ensure the user and default categories exist
@@ -153,6 +209,10 @@ def check_and_generate_invoice_provisions(user_id: str):
         current_time = datetime.now(timezone.utc)
         
         for card in cards:
+            # Pluggy already supplies card activity and billing dates. Creating
+            # a synthetic manual invoice would duplicate Open Finance data.
+            if card.get("source") == "pluggy":
+                continue
             closing_day = card["closing_day"]
             due_day = card["due_day"]
             card_id = card["id"]
@@ -187,17 +247,16 @@ def check_and_generate_invoice_provisions(user_id: str):
                         start_cycle = datetime(prev_year, prev_month, prev_actual_closing_day, 0, 0, 0, tzinfo=timezone.utc) + timedelta(days=1)
                         end_cycle = closing_datetime
                         
-                        tx_response = supabase_client.table("transactions").select("amount")\
+                        tx_response = supabase_client.table("transactions").select("amount, type")\
                             .eq("user_id", user_id)\
                             .eq("card_id", card_id)\
-                            .eq("type", 0)\
                             .eq("payment_method", "cartao")\
                             .eq("is_provision", False)\
                             .gte("date", start_cycle.isoformat())\
                             .lte("date", end_cycle.isoformat())\
                             .execute()
                             
-                        total_amount = sum(t["amount"] for t in tx_response.data)
+                        total_amount = sum_card_activity(tx_response.data)
                         
                         if total_amount > 0:
                             if due_day > closing_day:
@@ -434,6 +493,15 @@ def add_months(sourcedate, months):
     day = min(sourcedate.day, calendar.monthrange(year, month)[1])
     return datetime(year, month, day, sourcedate.hour, sourcedate.minute, sourcedate.second, sourcedate.microsecond, tzinfo=sourcedate.tzinfo)
 
+
+def sum_card_activity(transactions: list[dict]) -> int:
+    """Card debits increase the bill; credits/refunds reduce it."""
+    return sum(
+        transaction.get("amount", 0) if transaction.get("type", 0) == 0
+        else -transaction.get("amount", 0)
+        for transaction in transactions
+    )
+
 @app.post("/transactions", response_model=TransactionResponse, status_code=status.HTTP_201_CREATED)
 def create_transaction(transaction: TransactionCreate, user_id: str = Depends(get_user_id)):
     try:
@@ -618,7 +686,8 @@ def update_transaction(id: UUID, transaction: TransactionUpdate, user_id: str = 
             "is_provision": transaction.is_provision,
             "payment_method": transaction.payment_method,
             "card_id": card_id,
-            "invoice_period": invoice_period
+            "invoice_period": invoice_period,
+            "user_edited": True
         }
         
         response = supabase_client.table("transactions").update(payload).eq("id", str(id)).execute()
@@ -670,13 +739,26 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
             tx_type = tx.get("type", 0)
             payment_method = tx.get("payment_method", "dinheiro")
             
-            if tx_type == 1:
+            if tx_type == 1 and payment_method != "cartao":
                 cumulative_income += amount
             else:
                 if payment_method == "dinheiro":
                     cumulative_cash_expense += amount
                     
     balance = cumulative_income - cumulative_cash_expense
+
+    # For the current month, the institution balance is more accurate than a
+    # sum of imported history (Pluggy initially returns a limited lookback).
+    if month_str == datetime.now(timezone.utc).strftime("%Y-%m"):
+        account_balances = (
+            supabase_client.table("financial_accounts")
+            .select("balance")
+            .eq("user_id", user_id)
+            .eq("type", "BANK")
+            .execute()
+        ).data or []
+        if account_balances:
+            balance = sum(account.get("balance", 0) for account in account_balances)
 
     # 2. Retrieve all transactions for the month with their corresponding categories
     response = supabase_client.table("transactions").select("*, categories(*)").eq("user_id", user_id).gte("date", start_iso).lte("date", end_iso).execute()
@@ -702,7 +784,10 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
                 total_provisions_expense += amount
         else:
             if tx_type == 1:
-                total_income += amount
+                if payment_method == "cartao":
+                    total_card_expense -= amount
+                else:
+                    total_income += amount
             else:
                 card_id = tx.get("card_id")
                 
@@ -811,15 +896,14 @@ def calculate_summary(user_id: str, month_str: str) -> dict:
             else:
                 # Sum card purchases for this period
                 tx_purchases = supabase_client.table("transactions")\
-                    .select("amount")\
+                    .select("amount, type")\
                     .eq("user_id", user_id)\
                     .eq("card_id", card_id)\
-                    .eq("type", 0)\
                     .eq("payment_method", "cartao")\
                     .eq("is_provision", False)\
                     .eq("invoice_period", due_period)\
                     .execute()
-                invoice_amount = sum(t["amount"] for t in tx_purchases.data)
+                invoice_amount = sum_card_activity(tx_purchases.data)
                 
             next_month_card_liability += invoice_amount
     except Exception as e:
@@ -951,7 +1035,10 @@ def get_monthly_trend(
                 payment_method = tx.get("payment_method", "dinheiro")
                 
                 if tx_type == 1:
-                    monthly_data[tx_month]["income"] += amount
+                    if payment_method == "cartao":
+                        monthly_data[tx_month]["card_expense"] -= amount
+                    else:
+                        monthly_data[tx_month]["income"] += amount
                 else:
                     if payment_method == "cartao":
                         monthly_data[tx_month]["card_expense"] += amount
@@ -996,15 +1083,14 @@ def list_credit_cards(user_id: str = Depends(get_user_id)):
             
             active_period, cycle_start, cycle_end = get_active_invoice_cycle(card, current_time)
             
-            tx_active = supabase_client.table("transactions").select("amount")\
+            tx_active = supabase_client.table("transactions").select("amount, type")\
                 .eq("user_id", user_id)\
                 .eq("card_id", card_id)\
-                .eq("type", 0)\
                 .eq("payment_method", "cartao")\
                 .eq("is_provision", False)\
                 .eq("invoice_period", active_period)\
                 .execute()
-            current_invoice_amount = sum(t["amount"] for t in tx_active.data)
+            current_invoice_amount = sum_card_activity(tx_active.data)
             
             paid_txs = supabase_client.table("transactions")\
                 .select("invoice_period")\
@@ -1016,16 +1102,31 @@ def list_credit_cards(user_id: str = Depends(get_user_id)):
                 .execute()
             paid_periods = {t["invoice_period"] for t in paid_txs.data}
             
-            tx_all = supabase_client.table("transactions").select("amount, invoice_period")\
+            tx_all = supabase_client.table("transactions").select("amount, type, invoice_period")\
                 .eq("user_id", user_id)\
                 .eq("card_id", card_id)\
-                .eq("type", 0)\
                 .eq("payment_method", "cartao")\
                 .eq("is_provision", False)\
                 .execute()
                 
-            unpaid_amount = sum(t["amount"] for t in tx_all.data if t.get("invoice_period") not in paid_periods)
+            unpaid_amount = sum_card_activity(
+                [t for t in tx_all.data if t.get("invoice_period") not in paid_periods]
+            )
             available_limit = max(0, limit - unpaid_amount)
+
+            if card.get("source") == "pluggy" and card.get("pluggy_account_id"):
+                account = (
+                    supabase_client.table("financial_accounts")
+                    .select("balance")
+                    .eq("user_id", user_id)
+                    .eq("pluggy_account_id", card["pluggy_account_id"])
+                    .limit(1)
+                    .execute()
+                )
+                if account.data:
+                    current_invoice_amount = max(0, account.data[0].get("balance", 0))
+                if card.get("available_limit") is not None:
+                    available_limit = max(0, card["available_limit"])
             
             result.append({
                 "id": card_id,
@@ -1034,7 +1135,8 @@ def list_credit_cards(user_id: str = Depends(get_user_id)):
                 "closing_day": closing_day,
                 "due_day": due_day,
                 "current_invoice_amount": current_invoice_amount,
-                "available_limit": available_limit
+                "available_limit": available_limit,
+                "source": card.get("source", "manual")
             })
             
         return result
@@ -1150,3 +1252,281 @@ def delete_budget(
         return {"message": "Budget deleted successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- PLUGGY / OPEN FINANCE ENDPOINTS ---
+
+def _connection_for_item(item_id: str, user_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+    query = supabase_client.table("pluggy_connections").select("*").eq("item_id", item_id)
+    if user_id:
+        query = query.eq("user_id", user_id)
+    response = query.limit(1).execute()
+    return response.data[0] if response.data else None
+
+
+def _sync_connection_in_background(user_id: str, item_id: str, trigger_update: bool) -> None:
+    try:
+        client = get_pluggy_client()
+        if trigger_update:
+            try:
+                client.update_item(item_id)
+            except PluggyError as error:
+                # A running sync/frequency limit must not prevent importing the
+                # latest data already available at Pluggy.
+                if error.status_code not in (400, 409):
+                    raise
+        reconcile_item(client, user_id, item_id)
+    except Exception as error:
+        supabase_client.table("pluggy_connections").update(
+            {
+                "last_error": str(error)[:500],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).eq("item_id", item_id).eq("user_id", user_id).execute()
+
+
+@app.post("/pluggy/connect-token", response_model=PluggyConnectTokenResponse)
+def create_pluggy_connect_token(
+    request: PluggyConnectTokenRequest,
+    user_id: str = Depends(get_user_id),
+):
+    if request.item_id and not _connection_for_item(request.item_id, user_id):
+        raise HTTPException(status_code=404, detail="Conexão financeira não encontrada.")
+    try:
+        token = get_pluggy_client().create_connect_token(
+            user_id=user_id,
+            webhook_url=pluggy_webhook_url(),
+            item_id=request.item_id,
+        )
+        return {
+            "access_token": token["accessToken"],
+            "include_sandbox": settings.pluggy_include_sandbox,
+        }
+    except PluggyError as error:
+        raise_pluggy_http_error(error)
+
+
+@app.post("/pluggy/items", status_code=status.HTTP_202_ACCEPTED)
+def register_pluggy_item(
+    request: PluggyItemRegisterRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_user_id),
+):
+    try:
+        item = get_pluggy_client().get_item(request.item_id)
+        if item.get("clientUserId") != user_id:
+            raise HTTPException(status_code=403, detail="Esta conexão não pertence ao usuário atual.")
+        upsert_connection(user_id, item)
+        background_tasks.add_task(_sync_connection_in_background, user_id, request.item_id, False)
+        return {"message": "Conexão recebida. A importação foi iniciada."}
+    except PluggyError as error:
+        raise_pluggy_http_error(error)
+
+
+@app.get("/pluggy/connections", response_model=List[PluggyConnectionResponse])
+def list_pluggy_connections(user_id: str = Depends(get_user_id)):
+    response = (
+        supabase_client.table("pluggy_connections")
+        .select(
+            "item_id, connector_name, connector_image_url, status, execution_status, "
+            "last_successful_update_at, next_auto_sync_at, last_sync_at, last_error"
+        )
+        .eq("user_id", user_id)
+        .order("created_at")
+        .execute()
+    )
+    return response.data or []
+
+
+@app.post("/pluggy/sync", response_model=PluggySyncResponse, status_code=status.HTTP_202_ACCEPTED)
+def sync_pluggy_connections(
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_user_id),
+):
+    connections = (
+        supabase_client.table("pluggy_connections")
+        .select("item_id")
+        .eq("user_id", user_id)
+        .execute()
+    ).data or []
+    background_tasks.add_task(_retry_pending_pluggy_webhooks)
+    for connection in connections:
+        background_tasks.add_task(
+            _sync_connection_in_background,
+            user_id,
+            connection["item_id"],
+            True,
+        )
+    return {
+        "message": "Atualização iniciada. A Pluggy avisará quando os novos dados estiverem prontos.",
+        "connections_queued": len(connections),
+    }
+
+
+@app.delete("/pluggy/connections/{item_id}")
+def delete_pluggy_connection(item_id: str, user_id: str = Depends(get_user_id)):
+    if not _connection_for_item(item_id, user_id):
+        raise HTTPException(status_code=404, detail="Conexão financeira não encontrada.")
+    try:
+        get_pluggy_client().delete_item(item_id)
+        delete_imported_item_data(user_id, item_id)
+        return {"message": "Conexão e dados importados removidos."}
+    except PluggyError as error:
+        if error.status_code == 404:
+            delete_imported_item_data(user_id, item_id)
+            return {"message": "Dados locais da conexão removidos."}
+        raise_pluggy_http_error(error)
+
+
+def _process_pluggy_webhook(payload: dict[str, Any]) -> None:
+    event_id = payload.get("eventId")
+    item_id = payload.get("itemId")
+    event = payload.get("event", "")
+    try:
+        client = get_pluggy_client()
+        connection = _connection_for_item(item_id) if item_id else None
+        user_id = connection.get("user_id") if connection else payload.get("clientUserId")
+
+        if event == "transactions/deleted" and not user_id:
+            transaction_ids = payload.get("transactionIds") or []
+            if transaction_ids:
+                # This event may omit itemId/clientUserId. Pluggy transaction
+                # ids are global, so the source id safely resolves local rows.
+                supabase_client.table("transactions").delete().in_(
+                    "pluggy_transaction_id", transaction_ids
+                ).execute()
+            if event_id:
+                supabase_client.table("pluggy_webhook_events").update(
+                    {
+                        "status": "processed",
+                        "processed_at": datetime.now(timezone.utc).isoformat(),
+                        "last_error": None,
+                    }
+                ).eq("event_id", event_id).execute()
+            return
+
+        if not user_id:
+            raise PluggyError("Webhook sem usuário associado.", 422)
+
+        if event in ("item/created", "item/updated") and item_id:
+            item = client.get_item(item_id)
+            if item.get("clientUserId") != user_id:
+                raise PluggyError("O item recebido não pertence ao usuário informado.", 403)
+            upsert_connection(user_id, item)
+            if event == "item/created":
+                # Guarantees the initial history even if a transaction event was
+                # delayed or missed. Later syncs are incremental via webhooks.
+                reconcile_item(client, user_id, item_id)
+            else:
+                sync_accounts(client, user_id, item_id)
+
+        elif event == "item/error" and item_id:
+            error_data = payload.get("error") or {}
+            message = error_data.get("message") or error_data.get("code") or "Erro ao atualizar conexão."
+            supabase_client.table("pluggy_connections").update(
+                {"status": "ERROR", "last_error": str(message)[:500]}
+            ).eq("item_id", item_id).eq("user_id", user_id).execute()
+
+        elif event == "item/deleted" and item_id:
+            delete_imported_item_data(user_id, item_id)
+
+        elif event == "transactions/created" and item_id:
+            account_id = payload.get("accountId")
+            if not account_id:
+                raise PluggyError("Webhook de transação sem conta associada.", 422)
+            # Prefer the V2 link introduced for current applications.
+            transaction_link = payload.get("createdTransactionsLinkV2") or payload.get("createdTransactionsLink")
+            transactions = client.get_transactions_from_link(transaction_link) if transaction_link else []
+            if not transactions:
+                transactions = client.get_all_transactions(account_id)
+            if not connection:
+                sync_accounts(client, user_id, item_id)
+            sync_transactions(user_id, item_id, account_id, transactions)
+
+        elif event == "transactions/updated" and item_id:
+            account_id = payload.get("accountId")
+            transaction_ids = payload.get("transactionIds") or []
+            if account_id and transaction_ids:
+                page = client.get_transaction_page(
+                    account_id,
+                    transaction_ids=transaction_ids,
+                )
+                sync_transactions(user_id, item_id, account_id, page.get("results", []))
+
+        elif event == "transactions/deleted":
+            transaction_ids = payload.get("transactionIds") or []
+            if transaction_ids:
+                supabase_client.table("transactions").delete().eq("user_id", user_id).in_(
+                    "pluggy_transaction_id", transaction_ids
+                ).execute()
+
+        if event_id:
+            supabase_client.table("pluggy_webhook_events").update(
+                {
+                    "status": "processed",
+                    "processed_at": datetime.now(timezone.utc).isoformat(),
+                    "last_error": None,
+                }
+            ).eq("event_id", event_id).execute()
+    except Exception as error:
+        if event_id:
+            supabase_client.table("pluggy_webhook_events").update(
+                {"status": "failed", "last_error": str(error)[:1000]}
+            ).eq("event_id", event_id).execute()
+
+
+def _retry_pending_pluggy_webhooks() -> None:
+    events = (
+        supabase_client.table("pluggy_webhook_events")
+        .select("payload")
+        .in_("status", ["pending", "failed"])
+        .order("received_at")
+        .limit(20)
+        .execute()
+    ).data or []
+    for event in events:
+        if isinstance(event.get("payload"), dict):
+            _process_pluggy_webhook(event["payload"])
+
+
+@app.post("/webhooks/pluggy", status_code=status.HTTP_202_ACCEPTED)
+def receive_pluggy_webhook(
+    background_tasks: BackgroundTasks,
+    payload: dict[str, Any] = Body(...),
+    token: Optional[str] = Query(None),
+    x_pluggy_webhook_secret: Optional[str] = Header(None),
+):
+    provided_secret = x_pluggy_webhook_secret or token or ""
+    if not settings.pluggy_webhook_secret or not secrets.compare_digest(
+        provided_secret, settings.pluggy_webhook_secret
+    ):
+        raise HTTPException(status_code=401, detail="Webhook não autorizado.")
+
+    event_id = payload.get("eventId")
+    event_name = payload.get("event")
+    if not event_id or not event_name:
+        raise HTTPException(status_code=400, detail="Webhook inválido.")
+
+    existing = (
+        supabase_client.table("pluggy_webhook_events")
+        .select("event_id, status, payload")
+        .eq("event_id", event_id)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        if existing.data[0].get("status") != "processed":
+            background_tasks.add_task(_process_pluggy_webhook, existing.data[0]["payload"])
+        return {"received": True, "duplicate": True}
+
+    supabase_client.table("pluggy_webhook_events").insert(
+        {
+            "event_id": event_id,
+            "event_name": event_name,
+            "item_id": payload.get("itemId"),
+            "payload": payload,
+            "status": "pending",
+        }
+    ).execute()
+    background_tasks.add_task(_process_pluggy_webhook, payload)
+    return {"received": True}

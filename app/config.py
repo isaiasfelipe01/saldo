@@ -6,6 +6,11 @@ class Settings(BaseSettings):
     supabase_key: str
     host: str = "0.0.0.0"
     port: int = 8000
+    pluggy_client_id: str = ""
+    pluggy_client_secret: str = ""
+    pluggy_webhook_url: str = ""
+    pluggy_webhook_secret: str = ""
+    pluggy_include_sandbox: bool = False
 
     # Read from .env file if it exists, otherwise fall back to environment variables
     model_config = SettingsConfigDict(

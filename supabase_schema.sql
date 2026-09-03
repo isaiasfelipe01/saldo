@@ -82,3 +82,92 @@ CREATE TABLE IF NOT EXISTS budgets (
 
 -- Index for performance
 CREATE INDEX IF NOT EXISTS idx_budgets_user_period ON budgets(user_id, period);
+
+-- 8. Credit cards (manual rows are preserved; Pluggy rows use source='pluggy')
+CREATE TABLE IF NOT EXISTS credit_cards (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    "limit" BIGINT NOT NULL,
+    closing_day INTEGER NOT NULL,
+    due_day INTEGER NOT NULL,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+);
+
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS is_provision BOOLEAN DEFAULT FALSE NOT NULL;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method VARCHAR(20) DEFAULT 'dinheiro' NOT NULL;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS card_id UUID REFERENCES credit_cards(id) ON DELETE SET NULL;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS invoice_period VARCHAR(7);
+
+-- 9. Open Finance connection and account read models
+CREATE TABLE IF NOT EXISTS pluggy_connections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    item_id UUID NOT NULL UNIQUE,
+    connector_name VARCHAR(160) NOT NULL,
+    connector_image_url TEXT,
+    status VARCHAR(60) NOT NULL DEFAULT 'UNKNOWN',
+    execution_status VARCHAR(100),
+    last_successful_update_at TIMESTAMP WITH TIME ZONE,
+    next_auto_sync_at TIMESTAMP WITH TIME ZONE,
+    last_sync_at TIMESTAMP WITH TIME ZONE,
+    last_error TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS financial_accounts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    item_id UUID NOT NULL,
+    pluggy_account_id UUID NOT NULL UNIQUE,
+    name VARCHAR(160) NOT NULL,
+    type VARCHAR(30) NOT NULL,
+    subtype VARCHAR(60) NOT NULL,
+    balance BIGINT NOT NULL DEFAULT 0,
+    currency_code VARCHAR(8) NOT NULL DEFAULT 'BRL',
+    number VARCHAR(100),
+    institution_name VARCHAR(160) NOT NULL,
+    institution_image_url TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    CONSTRAINT financial_accounts_connection_fk
+        FOREIGN KEY (item_id) REFERENCES pluggy_connections(item_id) ON DELETE CASCADE
+);
+
+ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'manual' NOT NULL;
+ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS pluggy_item_id UUID;
+ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS pluggy_account_id UUID;
+ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS brand VARCHAR(50);
+ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS available_limit BIGINT;
+ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL;
+
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'manual' NOT NULL;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS pluggy_item_id UUID;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS pluggy_account_id UUID;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS pluggy_transaction_id UUID;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS pluggy_status VARCHAR(50);
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS raw_category VARCHAR(160);
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merchant_name VARCHAR(255);
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_edited BOOLEAN DEFAULT FALSE NOT NULL;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_credit_cards_pluggy_account
+    ON credit_cards(pluggy_account_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_pluggy_id
+    ON transactions(pluggy_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_pluggy_connections_user ON pluggy_connections(user_id);
+CREATE INDEX IF NOT EXISTS idx_financial_accounts_user ON financial_accounts(user_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_pluggy_account ON transactions(pluggy_account_id);
+
+-- 10. Durable idempotency log for webhook retries
+CREATE TABLE IF NOT EXISTS pluggy_webhook_events (
+    event_id UUID PRIMARY KEY,
+    event_name VARCHAR(100) NOT NULL,
+    item_id UUID,
+    payload JSONB NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    last_error TEXT,
+    received_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    processed_at TIMESTAMP WITH TIME ZONE
+);
