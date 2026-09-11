@@ -233,8 +233,7 @@ def check_and_generate_invoice_provisions(user_id: str):
                         .eq("user_id", user_id)\
                         .eq("card_id", card_id)\
                         .eq("invoice_period", month_str)\
-                        .eq("payment_method", "dinheiro")\
-                        .eq("is_provision", True)\
+                        .limit(1)\
                         .execute()
                     
                     if not tx_check.data:
@@ -279,19 +278,30 @@ def check_and_generate_invoice_provisions(user_id: str):
                                 category_id = cat_any.data[0]["id"] if cat_any.data else None
                                 
                             if category_id:
-                                provision_payload = {
-                                    "amount": total_amount,
-                                    "type": 0,
-                                    "category_id": category_id,
-                                    "description": f"Fatura {card_name} - {month_str}",
-                                    "date": due_datetime.isoformat(),
-                                    "user_id": user_id,
-                                    "is_provision": True,
-                                    "payment_method": "dinheiro",
-                                    "card_id": card_id,
-                                    "invoice_period": month_str
-                                }
-                                supabase_client.table("transactions").insert(provision_payload).execute()
+                                # Re-check before inserting to prevent concurrency race conditions
+                                re_check = supabase_client.table("transactions").select("id")\
+                                    .eq("user_id", user_id)\
+                                    .eq("card_id", card_id)\
+                                    .eq("invoice_period", month_str)\
+                                    .limit(1)\
+                                    .execute()
+                                if not re_check.data:
+                                    provision_payload = {
+                                        "amount": total_amount,
+                                        "type": 0,
+                                        "category_id": category_id,
+                                        "description": f"Fatura {card_name} - {month_str}",
+                                        "date": due_datetime.isoformat(),
+                                        "user_id": user_id,
+                                        "is_provision": True,
+                                        "payment_method": "dinheiro",
+                                        "card_id": card_id,
+                                        "invoice_period": month_str
+                                    }
+                                    try:
+                                        supabase_client.table("transactions").insert(provision_payload).execute()
+                                    except Exception:
+                                        pass
     except Exception as e:
         print(f"Error checking invoice provisions: {str(e)}")
 

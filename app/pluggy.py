@@ -417,16 +417,24 @@ def sync_transactions(
         raw_category = transaction.get("category")
         normalized_category = str(raw_category or "").strip().lower()
 
-        # A card statement payment also appears on its bank account. Keep the
-        # bank-side cash movement and omit the duplicate entry from the card.
-        is_card_payment = "credit card payment" in normalized_category
-        if account_type == "CREDIT" and is_card_payment:
-            continue
-
-        category_id = _find_category_id(user_id, transaction_type, preferred_category)
         merchant_value = transaction.get("merchant")
         merchant = merchant_value if isinstance(merchant_value, dict) else {}
         description = merchant.get("name") or transaction.get("description") or "Transação importada"
+        desc_lower = str(description).lower()
+
+        # A card statement payment also appears on its bank account. Keep the
+        # bank-side cash movement and omit the duplicate entry from the card.
+        card_payment_keywords = (
+            "credit card payment", "pagto antecipado", "pagamento antecipado",
+            "pagto fatura", "pagamento fatura", "pagto de fatura",
+            "pagamento de fatura", "pagto efetuado", "pgto fatura", "pagamento cartão",
+            "pagto cartao", "pagto pix"
+        )
+        is_card_payment = any(kw in normalized_category or kw in desc_lower for kw in card_payment_keywords)
+        if account_type == "CREDIT" and (is_card_payment or (upstream_type == "CREDIT" and "pagto" in desc_lower)):
+            continue
+
+        category_id = _find_category_id(user_id, transaction_type, preferred_category)
         transaction_date = _iso_date(transaction.get("date"))
         imported = existing.get(transaction_id)
         if imported and imported.get("user_edited"):
@@ -488,7 +496,18 @@ def sync_transactions(
         )
 
     if payloads:
-        supabase_client.table("transactions").upsert(payloads, on_conflict="pluggy_transaction_id").execute()
+        # Deduplicate payloads by pluggy_transaction_id to prevent Postgres/PostgREST conflict errors
+        unique_map = {}
+        for p in payloads:
+            tid = p.get("pluggy_transaction_id")
+            if tid:
+                unique_map[tid] = p
+        unique_payloads = list(unique_map.values())
+
+        batch_size = 50
+        for i in range(0, len(unique_payloads), batch_size):
+            chunk = unique_payloads[i:i + batch_size]
+            supabase_client.table("transactions").upsert(chunk, on_conflict="pluggy_transaction_id").execute()
     return len(payloads)
 
 
