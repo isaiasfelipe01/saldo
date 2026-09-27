@@ -108,6 +108,24 @@ def _normalise_transaction(row: dict, cards_by_account: dict) -> dict:
     }
 
 
+def _summary_totals(transactions: list[dict]) -> tuple[int, int, int]:
+    """Separate account cash flow from card purchases and refunds."""
+    income = account_expense = card_expense = 0
+    for row in transactions:
+        if (row["is_provision"] or row["excluded_from_income_expense"] or
+                row["transaction_nature"] in ("card_bill_payment", "internal_transfer", "investment_transfer")):
+            continue
+        nature = row["transaction_nature"]
+        amount = row["amount_cents"]
+        if nature in ("credit_card_purchase", "credit_card_refund"):
+            card_expense += -amount if nature == "credit_card_refund" else amount
+        elif row["transaction_type"] == "income":
+            income += amount
+        elif row["transaction_type"] == "expense":
+            account_expense += amount
+    return income, account_expense, card_expense
+
+
 @router.get("/overview")
 def overview(
     month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
@@ -134,19 +152,14 @@ def overview(
     ]
     transactions.sort(key=lambda row: (row["transaction_date"], row["id"]), reverse=True)
 
-    income = sum(row["amount_cents"] for row in transactions
-                 if not row["excluded_from_income_expense"] and not row["is_provision"]
-                 and row["transaction_type"] == "income" and row["transaction_nature"] != "credit_card_refund")
-    expense = sum((-1 if row["transaction_nature"] == "credit_card_refund" else 1) * row["amount_cents"]
-                  for row in transactions if not row["excluded_from_income_expense"]
-                  and not row["is_provision"] and (row["transaction_type"] == "expense"
-                  or row["transaction_nature"] == "credit_card_refund"))
+    income, expense, card_expense = _summary_totals(transactions)
     bank_balance = sum(int(account.get("balance_cents", account.get("balance", 0)) or 0)
                        for account in accounts if str(account.get("type", "")).upper() == "BANK")
 
     return {
         "month": month,
         "summary": {"income_cents": income, "expense_cents": expense,
+                    "card_expense_cents": card_expense,
                     "bank_balance_cents": bank_balance},
         "transactions": transactions,
         "accounts": [{
