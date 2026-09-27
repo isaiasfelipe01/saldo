@@ -3,7 +3,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     supabase_url: str
-    supabase_key: str
+    supabase_key: str = ""
+    supabase_service_role_key: str = ""
+    app_user_id: str = ""
+    app_api_token: str = ""
+    api_env: str = "production"
+    pluggy_sandbox: bool = False
     host: str = "0.0.0.0"
     port: int = 8000
     pluggy_client_id: str = ""
