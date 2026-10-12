@@ -152,7 +152,7 @@ def _import_item(client: PluggyClient, user_id: str, connection: dict,
             raw_category = str(transaction.get("category") or "").strip().lower()
             suggested_category = category_map.get((raw_category, kind))
             if previous and previous.get("raw_payload") == transaction:
-                if excluded and not previous.get("excluded_from_income_expense"):
+                if excluded and not previous.get("excluded_from_income_expense") and not previous.get("user_edited_exclusion"):
                     (supabase_client.table("transactions").update({
                         "transaction_nature": nature,
                         "is_internal_transfer": nature == "internal_transfer",
@@ -196,8 +196,7 @@ def _import_item(client: PluggyClient, user_id: str, connection: dict,
                 "excluded_from_income_expense": previous.get("excluded_from_income_expense", excluded) if previous else excluded,
                 "excluded_from_category_analytics": previous.get("excluded_from_category_analytics", excluded) if previous else excluded,
                 "user_edited_description": previous.get("user_edited_description", False) if previous else False,
-                "user_edited_category": previous.get("user_edited_category", False) if previous else False,
-                "raw_payload": transaction,
+                "user_edited_category": previous.get("user_edited_category", False) if previous else False,                "raw_payload": transaction,
                 "pluggy_created_at": transaction.get("createdAt"),
                 "pluggy_updated_at": transaction.get("updatedAt"),
                 "updated_at": timestamp,

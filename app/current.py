@@ -152,6 +152,11 @@ def transactions(month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
 class TransactionEdit(BaseModel):
     description: Optional[str] = Field(default=None, max_length=255)
     category_id: Optional[UUID] = None
+    excluded_from_income_expense: Optional[bool] = None
+
+
+def _is_missing_column(error: Exception, column: str) -> bool:
+    return column in str(error) and ("42703" in str(error) or "PGRST204" in str(error) or "column" in str(error).lower())
 
 
 @app.put("/transactions/{transaction_id}")
@@ -171,11 +176,26 @@ def update_transaction(transaction_id: UUID, data: TransactionEdit, user_id: str
         if not payload["description"]:
             raise HTTPException(status_code=422, detail="Informe uma descrição.")
         payload["user_edited_description"] = True
+    if "excluded_from_income_expense" in payload:
+        excluded = payload["excluded_from_income_expense"]
+        if excluded is None:
+            raise HTTPException(status_code=422, detail="Informe se o lançamento fica fora do resultado.")
+        # Fora do resultado também sai das análises por categoria, como na classificação automática.
+        payload["excluded_from_category_analytics"] = excluded
+        # A escolha do usuário vence a classificação automática nas próximas sincronizações.
+        payload["user_edited_exclusion"] = True
     if not payload:
         raise HTTPException(status_code=422, detail="Nenhuma alteração enviada.")
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
-    result = (supabase_client.table("transactions").update(payload)
-              .eq("id", str(transaction_id)).eq("user_id", user_id).execute().data or [])
+    query = lambda body: (supabase_client.table("transactions").update(body)
+                          .eq("id", str(transaction_id)).eq("user_id", user_id).execute().data or [])
+    try:
+        result = query(payload)
+    except Exception as error:
+        # Banco ainda sem a coluna de controle: aplica o ajuste mesmo assim.
+        if "user_edited_exclusion" not in payload or not _is_missing_column(error, "user_edited_exclusion"):
+            raise
+        result = query({key: value for key, value in payload.items() if key != "user_edited_exclusion"})
     if not result:
         raise HTTPException(status_code=404, detail="Lançamento não encontrado.")
     return result[0]
