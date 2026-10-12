@@ -41,17 +41,104 @@ class CategoryInput(BaseModel):
     icon: str = "•"
 
 
+SEPARATOR = " / "
+
+
+def _clean_name(name: str) -> str:
+    """Normalise spacing around the "Categoria / Subcategoria" separator."""
+    parts = [" ".join(part.split()) for part in name.split("/")]
+    if any(not part for part in parts):
+        raise HTTPException(status_code=422, detail="Informe o nome da categoria.")
+    return SEPARATOR.join(parts)
+
+
+def _main_name(name: str) -> str:
+    return name.split(SEPARATOR, 1)[0]
+
+
+def _ensure_unique(categories: list[dict], names: set[str], ignore_ids: set[str]) -> None:
+    taken = {(row.get("name") or "").casefold() for row in categories if str(row["id"]) not in ignore_ids}
+    clash = next((name for name in names if name.casefold() in taken), None)
+    if clash:
+        raise HTTPException(status_code=409, detail=f"Já existe uma categoria chamada “{clash}”.")
+
+
+def plan_category_rename(categories: list[dict], category_id: str, new_name: str) -> list[tuple[str, str]]:
+    """Return (id, name) updates. Renaming a main category carries its subcategories along;
+    renaming a subcategory to "Outra / Nome" moves it under another main category."""
+    target = next((row for row in categories if str(row["id"]) == category_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Categoria não encontrada.")
+    old_name = target.get("name") or ""
+    new_name = _clean_name(new_name)
+    if len(new_name) > 100:
+        raise HTTPException(status_code=422, detail="Use um nome de até 100 caracteres.")
+    same_type = [row for row in categories if row.get("type") == target.get("type")]
+    children = [] if SEPARATOR in old_name else [
+        row for row in same_type if (row.get("name") or "").startswith(old_name + SEPARATOR)]
+    if children and SEPARATOR in new_name:
+        raise HTTPException(status_code=422,
+                            detail="Uma categoria com subcategorias não pode virar subcategoria.")
+    if new_name.count(SEPARATOR) > 1:
+        raise HTTPException(status_code=422, detail="Use apenas um nível: Categoria / Subcategoria.")
+    if SEPARATOR in new_name:
+        parent = _main_name(new_name)
+        if not any(_main_name(row.get("name") or "").casefold() == parent.casefold()
+                   for row in same_type if str(row["id"]) != category_id):
+            raise HTTPException(status_code=422, detail=f"Categoria principal “{parent}” não encontrada.")
+    updates = [(category_id, new_name)]
+    updates += [(str(row["id"]), new_name + row["name"][len(old_name):]) for row in children]
+    _ensure_unique(categories, {name for _, name in updates}, {row_id for row_id, _ in updates})
+    return [(row_id, name) for row_id, name in updates
+            if name != next(row["name"] for row in categories if str(row["id"]) == row_id)]
+
+
+def plan_category_delete(categories: list[dict], category_id: str) -> list[str]:
+    """Ids removed when deleting a category: the category itself plus, for a main one, its subcategories."""
+    target = next((row for row in categories if str(row["id"]) == category_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Categoria não encontrada.")
+    name = target.get("name") or ""
+    children = [] if SEPARATOR in name else [
+        str(row["id"]) for row in categories
+        if row.get("type") == target.get("type") and (row.get("name") or "").startswith(name + SEPARATOR)]
+    return [category_id, *children]
+
+
 @app.post("/categories", status_code=201)
 def create_category(data: CategoryInput, user_id: str = Depends(_user_id)):
     if data.type not in ("income", "expense"):
         raise HTTPException(status_code=422, detail="Tipo de categoria inválido.")
-    name = data.name.strip()
-    if not name:
-        raise HTTPException(status_code=422, detail="Informe o nome da categoria.")
+    name = _clean_name(data.name)
+    _ensure_unique(_rows("categories", user_id), {name}, set())
     result = supabase_client.table("categories").insert({
         "user_id": user_id, "name": name, "type": data.type, "icon": data.icon,
     }).execute()
     return result.data[0]
+
+
+class CategoryRename(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+@app.put("/categories/{category_id}")
+def update_category(category_id: UUID, data: CategoryRename, user_id: str = Depends(_user_id)):
+    categories = _rows("categories", user_id)
+    updates = plan_category_rename(categories, str(category_id), data.name)
+    for row_id, name in updates:
+        (supabase_client.table("categories").update({"name": name})
+         .eq("id", row_id).eq("user_id", user_id).execute())
+    return sorted(_rows("categories", user_id), key=lambda row: row.get("name") or "")
+
+
+@app.delete("/categories/{category_id}")
+def delete_category(category_id: UUID, user_id: str = Depends(_user_id)):
+    ids = plan_category_delete(_rows("categories", user_id), str(category_id))
+    released = (supabase_client.table("transactions")
+                .update({"category_id": None, "updated_at": datetime.now(timezone.utc).isoformat()})
+                .eq("user_id", user_id).in_("category_id", ids).execute().data or [])
+    supabase_client.table("categories").delete().eq("user_id", user_id).in_("id", ids).execute()
+    return {"deleted": ids, "transactions_uncategorised": len(released)}
 
 
 @app.get("/transactions")
